@@ -151,7 +151,7 @@ do_update() {
         ;;
 
     incremental)
-        mount -t overlay overlay -o lowerdir="$IMAGE_MOUNT":"$ROOTFS_DIR $ROOTFS_DIR"
+        mount -t overlay overlay -o lowerdir="$IMAGE_MOUNT":"$ROOTFS_DIR" "$ROOTFS_DIR"
         ;;
 
     *)
