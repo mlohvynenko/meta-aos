@@ -245,6 +245,8 @@ aosupdate_run() {
         } 2>&1 >/dev/null
     )
 
+    sh
+
     if [ $? -ne 0 ]; then
         fail "$err"
         cleanup
