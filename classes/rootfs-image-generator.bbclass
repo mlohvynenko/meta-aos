@@ -72,6 +72,10 @@ create_incremental_update() {
         bbfatal "incremental roofs update is empty"
     fi
 
+    ROOTFS_DIFF_DIR=$(realpath ${ROOTFS_DIFF_DIR})
+    setfiles -m -r ${ROOTFS_DIFF_DIR} ${ROOTFS_FULL_PATH}/etc/selinux/aos/contexts/files/file_contexts ${ROOTFS_DIFF_DIR}
+
+
     mksquashfs ${ROOTFS_DIFF_DIR} ${AOS_ROOTFS_IMAGE_FILE} \
         -noappend -wildcards -all-root \
         ${@'' if not d.getVar('AOS_ROOTFS_EXCLUDE_ITEMS') else '-e '+ d.getVar('AOS_ROOTFS_EXCLUDE_ITEMS')}
