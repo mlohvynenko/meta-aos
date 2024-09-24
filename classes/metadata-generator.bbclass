@@ -15,10 +15,10 @@ def create_dep(id, required_version, min_version=None, max_version=None):
     return {FIELD_ID: id, FIELD_REQUIRED_VERSION: required_version, FIELD_MIN_VERSION: min_version, FIELD_MAX_VERSION: max_version}
 
 
-def create_component_metadata(id, file_name, vendor_version, description=None, install_dep=None, runtime_deps=None, annotations=None, download_ttl=None):
+def create_component_metadata(id, file_name, version, description=None, install_dep=None, runtime_deps=None, annotations=None, download_ttl=None):
     FIELD_ID = "id"
     FIELD_FILE_NAME = "fileName"
-    FIELD_VENDOR_VERSION = "vendorVersion"
+    FIELD_VERSION = "version"
     FIELD_DESCRIPTION = "description"
     FIELD_REQUIRED_VERSION = "requiredVersion"
     FIELD_MIN_VERSION = "minVersion"
@@ -28,12 +28,12 @@ def create_component_metadata(id, file_name, vendor_version, description=None, i
     FIELD_DOWNLOAD_TTL = "downloadTTL"
 
     # check mandatory fields
-    if not id or not file_name or not vendor_version:
+    if not id or not file_name or not version:
         raise RuntimeError(
-            "mandatory field ({} or {} or {}) is missing".format(FIELD_ID, FIELD_FILE_NAME, FIELD_VENDOR_VERSION))
+            "mandatory field ({} or {} or {}) is missing".format(FIELD_ID, FIELD_FILE_NAME, FIELD_VERSION))
 
     component = {FIELD_ID: id, FIELD_FILE_NAME: file_name,
-                 FIELD_VENDOR_VERSION: vendor_version, FIELD_DESCRIPTION: description, FIELD_ANNOTATIONS: annotations,
+                 FIELD_VERSION: version, FIELD_DESCRIPTION: description, FIELD_ANNOTATIONS: annotations,
                  FIELD_DOWNLOAD_TTL: download_ttl}
 
     # install dep
