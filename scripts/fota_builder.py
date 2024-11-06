@@ -112,10 +112,10 @@ class FotaBuilder:
         if var:
             metadata[varname] = var.as_str
 
-    def _add_runtime_dependencies(self, metadata, conf):
-        runtime_deps = conf.get("runtimeDependencies", None)
+    def _add_runtime_dependencies(self, conf, metadata):
+        runtime_deps = conf.get("runtimeDependencies", [])
 
-        if runtime_deps is None:
+        if len(runtime_deps) == 0:
             return
 
         meta_dependencies = []
@@ -151,7 +151,7 @@ class FotaBuilder:
         self._update_metadata_var(conf, "annotations", metadata)
         self._update_metadata_var(conf, "downloadTTL", metadata)
 
-        self._add_runtime_dependencies(metadata, conf)
+        self._add_runtime_dependencies(conf, metadata)
 
         return metadata
 
