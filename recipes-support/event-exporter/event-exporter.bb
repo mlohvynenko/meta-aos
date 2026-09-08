@@ -1,10 +1,14 @@
 SUMMARY = "Forwards log checkpoints to VictoriaMetrics as events"
 DESCRIPTION = "Tails journald for the given systemd units and pushes each line matching a regex \
-from /etc/event-exporter/patterns.yml (by default, AosCore's own \"[profiling] <text>\" \
+from /etc/event-exporter/config.yml (by default, AosCore's own \"[profiling] <text>\" \
 checkpoint lines, e.g. instance start/stop begin/end) to VictoriaMetrics as a checkpoint_event \
 sample, so Grafana can overlay them on the same graphs that plot CPU/MEM usage collected by \
 node-exporter/process-exporter/cgroup-exporter. Not AosCore-specific - which lines count as \
-checkpoints is entirely config-driven, not hardcoded."
+checkpoints, and (on the main node) which pairs of them define each operational-speed timing \
+metric, are both entirely config-driven, not hardcoded - see the same config.yml. On the main \
+node, it also watches VictoriaMetrics for completed AosCore deployment test suites and publishes \
+their aggregated timing as benchmark_result samples, so there is no need to separately run \
+report_timing.py."
 
 LICENSE = "Apache-2.0"
 LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/Apache-2.0;md5=89aea4e17d99a7cacdbeed46a0096b10"
@@ -36,7 +40,7 @@ FILES:${PN} += " \
 
 CONFFILES:${PN} += " \
     ${sysconfdir}/default/event-exporter \
-    ${sysconfdir}/event-exporter/patterns.yml \
+    ${sysconfdir}/event-exporter/config.yml \
 "
 
 # CM only runs on the main node; every node runs SM/IAM (see aos-image.inc). Picked via the
@@ -44,6 +48,12 @@ CONFFILES:${PN} += " \
 # mechanism aos-image.inc uses for IMAGE_INSTALL:append:aos-main-node.
 UNIT_ARGS = "--unit aos-sm --unit aos-iam"
 UNIT_ARGS:aos-main-node = "--unit aos-cm --unit aos-sm --unit aos-iam"
+
+# Test-suite timing resolution (see event_exporter.py's report_timing_loop()) queries VictoriaMetrics
+# globally and must run exactly once, so it's only enabled on the main node's instance - same
+# :aos-main-node override as UNIT_ARGS above.
+REPORT_TIMING_ARGS = ""
+REPORT_TIMING_ARGS:aos-main-node = "--report-timing"
 
 do_install() {
     install -d ${D}${libexecdir}/${BPN}
@@ -57,8 +67,9 @@ do_install() {
         -e 's|@VICTORIA_URL@|http://${AOS_MAIN_NODE_HOSTNAME}:8428|' \
         -e 's|@NODE@|${AOS_NODE_HOSTNAME}|' \
         -e 's|@UNIT_ARGS@|${UNIT_ARGS}|' \
+        -e 's|@REPORT_TIMING_ARGS@|${REPORT_TIMING_ARGS}|' \
         ${WORKDIR}/event-exporter.default > ${D}${sysconfdir}/default/event-exporter
 
     install -d ${D}${sysconfdir}/event-exporter
-    install -m 0644 ${WORKDIR}/event-exporter.yml ${D}${sysconfdir}/event-exporter/patterns.yml
+    install -m 0644 ${WORKDIR}/event-exporter.yml ${D}${sysconfdir}/event-exporter/config.yml
 }
