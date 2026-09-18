@@ -1,14 +1,14 @@
 SUMMARY = "Forwards log checkpoints to VictoriaMetrics as events"
 DESCRIPTION = "Tails journald for the given systemd units and pushes each line matching a regex \
-from /etc/event-exporter/config.yml (by default, AosCore's own \"[profiling] <text>\" \
+from /etc/event-exporter/event-exporter.yml (by default, AosCore's own \"[profiling] <text>\" \
 checkpoint lines, e.g. instance start/stop begin/end) to VictoriaMetrics as a checkpoint_event \
 sample, so Grafana can overlay them on the same graphs that plot CPU/MEM usage collected by \
 node-exporter/process-exporter/cgroup-exporter. Not AosCore-specific - which lines count as \
 checkpoints, and (on the main node) which pairs of them define each operational-speed timing \
-metric, are both entirely config-driven, not hardcoded - see the same config.yml. On the main \
-node, it also watches VictoriaMetrics for completed AosCore deployment test suites and publishes \
-their aggregated timing as benchmark_result samples, so there is no need to separately run \
-report_timing.py."
+metric, are both entirely config-driven, not hardcoded - see the same event-exporter.yml. On the \
+main node, it also watches VictoriaMetrics for completed AosCore deployment test suites and \
+publishes their aggregated timing as benchmark_result samples, so there is no need to separately \
+run report_timing.py."
 
 LICENSE = "Apache-2.0"
 LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/Apache-2.0;md5=89aea4e17d99a7cacdbeed46a0096b10"
@@ -40,7 +40,7 @@ FILES:${PN} += " \
 
 CONFFILES:${PN} += " \
     ${sysconfdir}/default/event-exporter \
-    ${sysconfdir}/event-exporter/config.yml \
+    ${sysconfdir}/event-exporter/event-exporter.yml \
 "
 
 # CM only runs on the main node; every node runs SM/IAM (see aos-image.inc). Picked via the
@@ -71,5 +71,5 @@ do_install() {
         ${WORKDIR}/event-exporter.default > ${D}${sysconfdir}/default/event-exporter
 
     install -d ${D}${sysconfdir}/event-exporter
-    install -m 0644 ${WORKDIR}/event-exporter.yml ${D}${sysconfdir}/event-exporter/config.yml
+    install -m 0644 ${WORKDIR}/event-exporter.yml ${D}${sysconfdir}/event-exporter/event-exporter.yml
 }

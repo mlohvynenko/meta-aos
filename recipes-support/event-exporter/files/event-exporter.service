@@ -20,7 +20,7 @@ EnvironmentFile=/etc/default/event-exporter
 # printed to stdout showed up in the journal at all after several minutes of the service running.
 ExecStart=/usr/bin/python3 -u /usr/libexec/event-exporter/event_exporter.py \
     --victoria-url ${VICTORIA_URL} \
-    --config /etc/event-exporter/config.yml \
+    --config /etc/event-exporter/event-exporter.yml \
     --node ${NODE} \
     $UNIT_ARGS \
     $REPORT_TIMING_ARGS

@@ -204,9 +204,24 @@ def format_precise_time(timestamp_us):
     return dt.strftime("%Y-%m-%d %H:%M:%S.%f")
 
 
+class VictoriaMetricsError(Exception):
+    """Raised by push_line()/query_metrics() on a transport or malformed-response failure talking to
+    VictoriaMetrics - distinct from a request that succeeded but simply found nothing (query_metrics()
+    still returns [] for that). Conflating the two used to mean a transient outage during
+    report_timing_loop()'s suite resolution looked identical to "this checkpoint genuinely doesn't
+    exist", so resolve_suite()'s BOUNDED_WAIT_SECONDS logic could permanently report a real timing as
+    n/a, and publish_results() could silently drop a sample, just because VictoriaMetrics happened to
+    be briefly unreachable. push_event() (the always-critical live event-forwarding path, called from
+    the main thread) still catches this itself and only logs it - see push_event() - since one missed
+    checkpoint there shouldn't crash the whole process, but report_timing_loop()'s own callers let it
+    propagate so the *whole current suite* aborts and retries (see report_timing_loop()) instead of
+    being silently mis-recorded."""
+
+
 def push_line(victoria_url, line):
     """POST a single Prometheus exposition-format line to VictoriaMetrics's /api/v1/import/prometheus
-    endpoint - shared by push_event() and push_result()."""
+    endpoint - shared by push_event() and push_result(). Raises VictoriaMetricsError on a transport
+    failure - see VictoriaMetricsError - rather than swallowing it."""
     request = urllib.request.Request(
         f"{victoria_url.rstrip('/')}/api/v1/import/prometheus",
         data=line.encode(),
@@ -217,11 +232,14 @@ def push_line(victoria_url, line):
         with urllib.request.urlopen(request, timeout=5) as response:
             response.read()
     except urllib.error.URLError as err:
-        print(f"failed to push to VictoriaMetrics: {err}", file=sys.stderr)
+        raise VictoriaMetricsError(f"failed to push to VictoriaMetrics: {err}") from err
 
 
 def push_event(victoria_url, timestamp_us, node, source, text):
-    """Push a single checkpoint_event sample to VictoriaMetrics for this checkpoint."""
+    """Push a single checkpoint_event sample to VictoriaMetrics for this checkpoint. Unlike
+    push_result() (report-timing only), a failure here is caught and only logged - see
+    VictoriaMetricsError - since this runs on the main thread for every matching journal line, and one
+    dropped checkpoint shouldn't crash the whole process the way an unhandled exception here would."""
     labels = ",".join(
         f'{name}="{escape_label_value(value)}"'
         for name, value in (
@@ -239,7 +257,10 @@ def push_event(victoria_url, timestamp_us, node, source, text):
     # pushed 500us apart both landed on the same millisecond) - the "time_us" label above is what
     # actually carries full precision, since labels aren't subject to that storage limit.
     time_s = timestamp_us / 1_000_000
-    push_line(victoria_url, f"checkpoint_event{{{labels}}} 1 {time_s:.3f}")
+    try:
+        push_line(victoria_url, f"checkpoint_event{{{labels}}} 1 {time_s:.3f}")
+    except VictoriaMetricsError as err:
+        print(err, file=sys.stderr)
 
 
 def _handle_sigterm(signum, frame):
@@ -375,7 +396,6 @@ INSTANT_QUERY_LOOKBACK_US = 5 * 60 * 1_000_000
 
 TOTAL_START_SOURCE = AOS_CM_SERVICE
 TOTAL_START_EVENT = "Process desired status"
-INSTANCE_START_QUERY = 'checkpoint_event{source=~"^Instance: .*",event="Start"}'
 
 # How often an unresolved metric or a not-yet-started suite is re-polled - see resolve_suite() and
 # wait_for_new_suite(). There is no attempt limit for most metrics: this waits until interrupted
@@ -421,6 +441,16 @@ BOUNDED_WAIT_SECONDS = 40
 # own suite-defining instance-start and leaving wait_for_new_suite() unable to ever recognize it as
 # new. Picking the earliest occurrence in the window (not the latest) is a second, independent guard
 # against the same failure mode, in case two suites ever do land inside one window regardless.
+#
+# Residual risk, accepted rather than eliminated: if a *next* suite's own defining instance-start
+# happens within this window and that next suite's own fresh "Process desired status" is the only
+# occurrence in it (i.e. the current suite has none of its own to find first), the earliest-pick
+# above still folds that next suite's own start into the boundary - not wrongly inflating anything
+# this time, but leaving the *next* suite's own Total unable to find its own start (excluded by its
+# own not_before_us), reading n/a instead of its real value. Narrowing this window from 30s to 10s
+# already shrinks how often two suites could land inside it together; closing the gap fully would
+# need something more than simple time-windowing (e.g. correlating a candidate against the next
+# suite's own boundary once it's known, which isn't available yet at the point this runs).
 TOTAL_FINISH_LOOKAHEAD_US = 10 * 1_000_000
 
 
@@ -458,25 +488,61 @@ def escape_promql_string(text):
 STOP_ALL_PREFIX = "Stop all "
 
 
-def event_query(source, event):
+def event_query(node, source, event):
     """A PromQL selector matching a checkpoint_event whose event is exactly `event`, or `event`
     followed by AosCore's own ": key=value, ..." detail suffix - see the module docstring. `event`
     is regex-escaped first, since some checkpoint texts contain regex metacharacters of their own
     (e.g. the literal "..." in "Starting AosCore Service Manager..."), then PromQL-string-escaped -
-    see escape_promql_string()."""
+    see escape_promql_string().
+
+    Also scoped to `node`: every node in the unit runs its own event_exporter.py, and SM/IAM run on
+    every node (see the module docstring), so aos-sm.service's own checkpoints for a *different*
+    node's own instances land in this same central VictoriaMetrics under the same source/event but a
+    different "node" label. Without this, "the latest occurrence of X" could pick up one node's start
+    and another node's end for what's actually two unrelated local operations, on a deployment
+    touching more than one node at once. report_timing_loop() always scopes to its own `node` (the
+    main node it runs on - see event-exporter.bb's REPORT_TIMING_ARGS)."""
     pattern = escape_promql_string(_escape_regex_literal(event))
-    return f'checkpoint_event{{source="{escape_promql_string(source)}",event=~"^{pattern}(:.*)?$"}}'
+    return (
+        f'checkpoint_event{{node="{escape_promql_string(node)}",source="{escape_promql_string(source)}",'
+        f'event=~"^{pattern}(:.*)?$"}}'
+    )
+
+
+def instance_start_query(node):
+    """PromQL selector for `node`'s own benchmark-timing "Instance: <id> / Start" checkpoints - see
+    event_query()'s own node-scoping note. Used to detect a new suite (wait_for_new_suite()) and to
+    build the per-instance "Start instances" breakdown (query_instance_samples())."""
+    return f'checkpoint_event{{node="{escape_promql_string(node)}",source=~"^Instance: .*",event="Start"}}'
+
+
+# Overrides VictoriaMetrics' own default instant-query staleness window (query_metrics()'s own
+# "max_lookback" param) - without this, a checkpoint whose event happened more than VictoriaMetrics'
+# own default (~5 minutes) before a query's own evaluation time is invisible to that query even
+# though the sample is still in VictoriaMetrics - confirmed empirically: a sample pushed 10 minutes
+# before the query's evaluation time was missing from a default query and only appeared once
+# max_lookback was widened past that gap. This matters for real Operational Speed runs, not just this
+# script's own tests: "Download update items start" happens at the very beginning of a deployment,
+# and a large enough image download can easily take longer than 5 minutes before "Download update
+# items end" (or the run's own last-instance-start, which every lookup here is bounded by) shows up -
+# without a wide-enough max_lookback, that legitimate "Download" start would silently read as n/a
+# once BOUNDED_WAIT_SECONDS ran out, even though the real sample was sitting in VictoriaMetrics the
+# whole time. 30 minutes is generous for any Operational Speed run this benchmark plan currently
+# exercises; a run genuinely slower than that would need this widened further.
+QUERY_MAX_LOOKBACK_US = 30 * 60 * 1_000_000
 
 
 def query_metrics(victoria_url, promql, at_time_us=None):
     """Runs an instant PromQL query against VictoriaMetrics and returns every matching sample's full
-    label set (a dict, as VictoriaMetrics' own "metric" field). Returns [] if nothing matches or the
-    query fails."""
+    label set (a dict, as VictoriaMetrics' own "metric" field). Returns [] if the query succeeded but
+    nothing matches; raises VictoriaMetricsError - see VictoriaMetricsError - on a transport or
+    malformed-response failure, so callers can tell "no such checkpoint" apart from "couldn't ask"."""
     params = {
         "query": promql,
         # Without this, VictoriaMetrics can serve a cached response from an earlier attempt at the
         # same query string, masking a checkpoint that has since become visible.
         "nocache": "1",
+        "max_lookback": f"{QUERY_MAX_LOOKBACK_US // 1_000_000}s",
     }
     if at_time_us is not None:
         params["time"] = f"{at_time_us / 1_000_000:.6f}"
@@ -488,8 +554,7 @@ def query_metrics(victoria_url, promql, at_time_us=None):
         with urllib.request.urlopen(request, timeout=5) as response:
             body = json.loads(response.read())
     except (urllib.error.URLError, json.JSONDecodeError) as err:
-        print(f"failed to query VictoriaMetrics: {err}", file=sys.stderr)
-        return []
+        raise VictoriaMetricsError(f"failed to query VictoriaMetrics: {err}") from err
 
     return [entry.get("metric", {}) for entry in body.get("data", {}).get("result", [])]
 
@@ -515,12 +580,12 @@ def query_latest_us(victoria_url, promql, at_time_us=None, not_before_us=None):
     return max(samples) if samples else None
 
 
-def query_instance_samples(victoria_url, at_time_us=None):
-    """Like query_samples_us(), but for INSTANCE_START_QUERY specifically, returning (instance_id,
-    time_us) pairs - the "source" label with the "Instance: " prefix stripped, since that's the
-    per-instance breakdown "Start instances" needs (see resolve_suite())."""
+def query_instance_samples(victoria_url, node, at_time_us=None):
+    """Like query_samples_us(), but for instance_start_query(node) specifically, returning
+    (instance_id, time_us) pairs - the "source" label with the "Instance: " prefix stripped, since
+    that's the per-instance breakdown "Start instances" needs (see resolve_suite())."""
     samples = []
-    for metric in query_metrics(victoria_url, INSTANCE_START_QUERY, at_time_us):
+    for metric in query_metrics(victoria_url, instance_start_query(node), at_time_us):
         time_us_label = metric.get("time_us")
         if not time_us_label:
             continue
@@ -538,8 +603,10 @@ class RangeJob:
     load_config()."""
 
     def __init__(
-        self, label, start_source, start_event, end_source, end_event, nearest_end=False, optional_all=False
+        self, node, label, start_source, start_event, end_source, end_event, nearest_end=False,
+        optional_all=False
     ):
+        self.node = node
         self.label = label
         self.start_source = start_source
         self.start_event = start_event
@@ -585,7 +652,7 @@ class RangeJob:
         if self.start_us is None:
             self.start_us = query_latest_us(
                 victoria_url,
-                event_query(self.start_source, self.start_event),
+                event_query(self.node, self.start_source, self.start_event),
                 at_time_us=suite_end_us,
                 not_before_us=not_before_us,
             )
@@ -603,7 +670,7 @@ class RangeJob:
                 # separate not_before_us filtering needed here.
                 candidates = query_samples_us(
                     victoria_url,
-                    event_query(self.end_source, self.end_event),
+                    event_query(self.node, self.end_source, self.end_event),
                     at_time_us=self.start_us + INSTANT_QUERY_LOOKBACK_US,
                 )
                 candidates = [us for us in candidates if self.start_us <= us <= suite_end_us]
@@ -611,7 +678,7 @@ class RangeJob:
             else:
                 self.end_us = query_latest_us(
                     victoria_url,
-                    event_query(self.end_source, self.end_event),
+                    event_query(self.node, self.end_source, self.end_event),
                     at_time_us=suite_end_us,
                     not_before_us=not_before_us,
                 )
@@ -635,7 +702,10 @@ class RangeJob:
 
         def latest(source, event):
             return query_latest_us(
-                victoria_url, event_query(source, event), at_time_us=suite_end_us, not_before_us=not_before_us
+                victoria_url,
+                event_query(self.node, source, event),
+                at_time_us=suite_end_us,
+                not_before_us=not_before_us,
             )
 
         start_us = latest(self.start_source, self.start_event)
@@ -670,7 +740,8 @@ class TotalJob:
     status", so tying it to this job would leave it just as stuck on "Total" as everything else used
     to be."""
 
-    def __init__(self, end_us):
+    def __init__(self, node, end_us):
+        self.node = node
         self.label = "Total"
         self.end_us = end_us
 
@@ -679,7 +750,7 @@ class TotalJob:
         # resolve_suite() can call every pending job, RangeJob or TotalJob, the same way.
         start_us = query_latest_us(
             victoria_url,
-            event_query(TOTAL_START_SOURCE, TOTAL_START_EVENT),
+            event_query(self.node, TOTAL_START_SOURCE, TOTAL_START_EVENT),
             at_time_us=self.end_us,
             not_before_us=not_before_us,
         )
@@ -691,7 +762,7 @@ class TotalJob:
         return True
 
 
-def _next_not_before_us(victoria_url, suite_end_us):
+def _next_not_before_us(victoria_url, node, suite_end_us):
     """The exclusion boundary to hand the next suite - normally just suite_end_us, except "Process
     desired status" logs a second "finish" occurrence strictly after suite_end_us (see
     TOTAL_FINISH_LOOKAHEAD_US), which would otherwise leak into the next suite's own TotalJob lookup
@@ -707,27 +778,51 @@ def _next_not_before_us(victoria_url, suite_end_us):
     always this suite's own trailing finish, never a later suite's start."""
     candidates = query_samples_us(
         victoria_url,
-        event_query(TOTAL_START_SOURCE, TOTAL_START_EVENT),
+        event_query(node, TOTAL_START_SOURCE, TOTAL_START_EVENT),
         at_time_us=suite_end_us + TOTAL_FINISH_LOOKAHEAD_US,
         not_before_us=suite_end_us,
     )
     return min(candidates) if candidates else suite_end_us
 
 
-def wait_for_new_suite(victoria_url, last_end_us):
+# How long wait_for_new_suite() keeps re-checking for an even-newer instance-start after finding one,
+# before treating it as this suite's own final boundary. A multi-instance batch's own Start
+# checkpoints have landed within milliseconds of each other in every run observed so far, so this is
+# generous headroom, not a tight race - but nothing guarantees every instance in a batch reports
+# within a single poll, and without this, wait_for_new_suite() has no way to tell "the last instance
+# of this batch" apart from "an instance that happened to report first, with more of the same batch
+# still incoming": locking in the latter as suite_end_us would split one real suite into two and
+# permanently exclude whichever instances land after it from this suite's own resolution (every
+# lookup here is bounded to at-or-before suite_end_us - see RangeJob.try_resolve()).
+SUITE_SETTLE_SECONDS = 2
+
+
+def wait_for_new_suite(victoria_url, node, last_end_us):
     """Polls (every REPORT_POLL_INTERVAL_SECONDS, forever) until a newer "Total" end - the last
     instance's own Start - shows up than `last_end_us` (None on the very first call, meaning
     "whatever's current right now"), then returns it. This is what turns suite resolution into a
-    continuous watcher instead of a one-shot report."""
+    continuous watcher instead of a one-shot report.
+
+    Once a candidate shows up, keeps re-checking for SUITE_SETTLE_SECONDS of consecutive quiet before
+    returning it, in case more of the same instance batch is still trickling in - see
+    SUITE_SETTLE_SECONDS."""
     while True:
-        end_us = query_latest_us(victoria_url, INSTANCE_START_QUERY, not_before_us=last_end_us)
+        end_us = query_latest_us(victoria_url, instance_start_query(node), not_before_us=last_end_us)
         if end_us is not None:
+            settled_since = time.monotonic()
+            while time.monotonic() - settled_since < SUITE_SETTLE_SECONDS:
+                time.sleep(1)
+                newer_end_us = query_latest_us(victoria_url, instance_start_query(node), not_before_us=end_us)
+                if newer_end_us is not None:
+                    end_us = newer_end_us
+                    settled_since = time.monotonic()
+
             return end_us
 
         time.sleep(REPORT_POLL_INTERVAL_SECONDS)
 
 
-def resolve_suite(victoria_url, not_before_us, suite_end_us, checkpoint_ranges):
+def resolve_suite(victoria_url, node, not_before_us, suite_end_us, checkpoint_ranges):
     """Resolves every metric for one test suite - waiting indefinitely (polling every
     REPORT_POLL_INTERVAL_SECONDS) for whichever checkpoints haven't shown up yet, with no attempt
     limit, except `bounded_labels` (see the "Init SM"/"Release SM" note above), which are reported
@@ -746,8 +841,8 @@ def resolve_suite(victoria_url, not_before_us, suite_end_us, checkpoint_ranges):
     above. Returns (results, range_jobs) - the caller already knows suite_end_us to tell this suite
     apart from the next one wait_for_new_suite() finds, so it isn't returned again."""
     results = {}
-    range_jobs = [RangeJob(**range_def) for range_def in checkpoint_ranges]
-    total_job = TotalJob(suite_end_us)
+    range_jobs = [RangeJob(node=node, **range_def) for range_def in checkpoint_ranges]
+    total_job = TotalJob(node, suite_end_us)
     pending = list(range_jobs) + [total_job]
     bounded_labels = {job.label for job in range_jobs} | {"Total"}
 
@@ -776,7 +871,7 @@ def resolve_suite(victoria_url, not_before_us, suite_end_us, checkpoint_ranges):
     if start_instances_job.start_us is not None:
         # Only the instances that belong to this suite, not a stale one still inside VictoriaMetrics'
         # lookback window from an earlier run.
-        instances = query_instance_samples(victoria_url, at_time_us=suite_end_us)
+        instances = query_instance_samples(victoria_url, node, at_time_us=suite_end_us)
         results["instances"] = sorted(
             ((iid, us) for iid, us in instances if us >= start_instances_job.start_us),
             key=lambda pair: pair[1],
@@ -850,6 +945,47 @@ def publish_results(victoria_url, node, range_jobs, results):
         push_result(victoria_url, node, f"Instance: {instance_id}", metric_name(START_INSTANCES_LABEL), duration_s)
 
 
+def _seed_last_end_us(victoria_url, node):
+    """The boundary report_timing_loop() starts watching from - seeded with whatever instance-start
+    is already the latest right now for `node`, not None: unlike report_timing.py (a script a human
+    starts *before* triggering a deployment, so nothing was "current" yet when it started), this
+    thread can start at any point in a long-lived service's life - after a crash, a manual restart,
+    or an upgrade - with an arbitrary, possibly-stale suite already sitting in VictoriaMetrics from
+    whenever the service last stopped. Starting from None would let wait_for_new_suite() immediately
+    treat that pre-existing suite as brand "new" and resolve_suite() would then run with no
+    previous-suite boundary at all (not_before_us=None), free to pull in "the latest occurrence of X"
+    for every checkpoint regardless of which past suite it actually belongs to - confirmed
+    empirically: a plain service restart re-published a fabricated suite built from two different,
+    unrelated past deployments' checkpoints, including a bogus "Total". Seeding here instead means
+    only a suite whose defining instance-start happens *after* this thread started watching is ever
+    resolved - anything already sitting in VictoriaMetrics from before that is silently skipped
+    rather than risking a wrong result for it.
+
+    Also run through _next_not_before_us() before being returned, same as after every in-loop suite
+    in report_timing_loop() - otherwise this seed has the exact same gap _next_not_before_us() exists
+    to close, just at startup instead of between suites: the pre-existing suite's own trailing
+    "Process desired status" finish occurrence (see TOTAL_FINISH_LOOKAHEAD_US) lands *after* its own
+    last-instance-start, so seeding with only that timestamp leaves the finish event unexcluded and
+    available to leak into this thread's first suite's own TotalJob lookup if that suite has no fresh
+    occurrence of its own - confirmed empirically: a restart shortly after a suite produced a bogus
+    multi-minute "Total" this way, using the previous suite's own leftover finish event as the new
+    suite's start.
+
+    Retries indefinitely (every REPORT_POLL_INTERVAL_SECONDS) on a VictoriaMetricsError, rather than
+    letting it propagate out of report_timing_loop() before its own while True: try: loop even
+    starts (which would silently and permanently end timing publication for the rest of the service's
+    lifetime, since nothing else would catch it): `After=victoria-metrics.service` orders unit
+    *start*, not its HTTP endpoint actually being ready to answer, so this thread's very first request
+    can legitimately fail even on a normal boot."""
+    while True:
+        try:
+            seed_end_us = query_latest_us(victoria_url, instance_start_query(node))
+            return _next_not_before_us(victoria_url, node, seed_end_us) if seed_end_us is not None else None
+        except VictoriaMetricsError as err:
+            print(f"report-timing: error seeding baseline: {err}", file=sys.stderr)
+            time.sleep(REPORT_POLL_INTERVAL_SECONDS)
+
+
 def report_timing_loop(victoria_url, node, checkpoint_ranges):
     """Runs forever (one test suite at a time): waits for a new suite (wait_for_new_suite()),
     resolves its timing (resolve_suite()), and always publishes it to VictoriaMetrics
@@ -857,49 +993,37 @@ def report_timing_loop(victoria_url, node, checkpoint_ranges):
     optional, since the whole point of running this inline is that nobody has to remember to pass
     it (or look at this service's own console output at all - Grafana's "Benchmark Results" table,
     fed by publish_results(), is the real output; the prints here are debug traces only, not a
-    user-facing report like report_timing.py's own print_report() used to produce). Runs as a
-    daemon thread (see main()): errors are caught and retried rather than propagated, since there's
-    no separate process supervisor (systemd Restart=) watching this thread the way there is for the
-    process as a whole, and one bad suite shouldn't silently end timing publication for the rest of
-    the service's lifetime."""
+    user-facing report like report_timing.py's own print_report() used to produce).
+
+    `last_end_us` only advances *after* publish_results() succeeds, not right after resolve_suite()
+    returns: a VictoriaMetricsError raised anywhere in either call aborts this attempt entirely (see
+    below) without having moved the boundary, so the exact same suite is retried next time around
+    rather than being silently marked "done" despite a failed - or, for a push failure partway
+    through publish_results(), partial - write. A retry after a partial publish failure re-pushes
+    every metric from scratch, including whichever already succeeded before the failure - accepted
+    here as a rare, cosmetic duplicate-sample risk (each push is its own timestamped point, not an
+    overwrite) rather than building a persisted per-suite publish log just to avoid it.
+
+    Runs as a daemon thread (see main()): errors are caught and retried rather than propagated, since
+    there's no separate process supervisor (systemd Restart=) watching this thread the way there is
+    for the process as a whole, and one bad suite - including a VictoriaMetricsError from any query or
+    push above, deliberately not swallowed at the source - shouldn't silently end timing publication
+    for the rest of the service's lifetime."""
     print(f"report-timing: debug: watching {victoria_url} for new test suites")
 
     suite_number = 0
-    # Seeded with whatever instance-start is already the latest right now, not None: unlike
-    # report_timing.py (a script a human starts *before* triggering a deployment, so nothing was
-    # "current" yet when it started), this thread can start at any point in a long-lived service's
-    # life - after a crash, a manual restart, or an upgrade - with an arbitrary, possibly-stale suite
-    # already sitting in VictoriaMetrics from whenever the service last stopped. Starting from None
-    # would let wait_for_new_suite() immediately treat that pre-existing suite as brand "new" and
-    # resolve_suite() would then run with no previous-suite boundary at all (not_before_us=None),
-    # free to pull in "the latest occurrence of X" for every checkpoint regardless of which past
-    # suite it actually belongs to - confirmed empirically: a plain service restart re-published a
-    # fabricated suite built from two different, unrelated past deployments' checkpoints, including a
-    # bogus "Total". Seeding here instead means only a suite whose defining instance-start happens
-    # *after* this thread started watching is ever resolved - anything already sitting in
-    # VictoriaMetrics from before that is silently skipped rather than risking a wrong result for it.
-    #
-    # Run through _next_not_before_us() too, same as after every in-loop suite below - otherwise
-    # this seed has the exact same gap _next_not_before_us() exists to close, just at startup
-    # instead of between suites: the pre-existing suite's own trailing "Process desired status"
-    # finish occurrence (see TOTAL_FINISH_LOOKAHEAD_US) lands *after* its own last-instance-start,
-    # so seeding with only that timestamp leaves the finish event unexcluded and available to leak
-    # into this thread's first suite's own TotalJob lookup if that suite has no fresh occurrence of
-    # its own - confirmed empirically: a restart shortly after a suite produced a bogus multi-minute
-    # "Total" this way, using the previous suite's own leftover finish event as the new suite's start.
-    seed_end_us = query_latest_us(victoria_url, INSTANCE_START_QUERY)
-    last_end_us = _next_not_before_us(victoria_url, seed_end_us) if seed_end_us is not None else None
+    last_end_us = _seed_last_end_us(victoria_url, node)
 
     while True:
         try:
-            suite_end_us = wait_for_new_suite(victoria_url, last_end_us)
+            suite_end_us = wait_for_new_suite(victoria_url, node, last_end_us)
 
             suite_number += 1
 
-            results, range_jobs = resolve_suite(victoria_url, last_end_us, suite_end_us, checkpoint_ranges)
-            last_end_us = _next_not_before_us(victoria_url, suite_end_us)
-
+            results, range_jobs = resolve_suite(victoria_url, node, last_end_us, suite_end_us, checkpoint_ranges)
             publish_results(victoria_url, node, range_jobs, results)
+            last_end_us = _next_not_before_us(victoria_url, node, suite_end_us)
+
             print(f"report-timing: debug: suite {suite_number} published: {_debug_metrics(results)}")
         except Exception as err:  # noqa: BLE001 - keep the thread alive across any single failure
             print(f"report-timing: error resolving suite: {err}", file=sys.stderr)
@@ -915,6 +1039,18 @@ def main():
     patterns, checkpoint_ranges = load_config(args.config)
 
     if args.report_timing:
+        # resolve_suite() later does next(job for job in range_jobs if job.label ==
+        # START_INSTANCES_LABEL) unconditionally, for the per-instance "Start instances" breakdown -
+        # checked here, once, at startup, rather than letting a config with no ranges at all (or a
+        # renamed/misspelled "Start instances" entry) raise StopIteration inside the background
+        # thread on its first suite, silently killing timing publication instead of failing loudly
+        # before anything starts.
+        if not any(r["label"] == START_INSTANCES_LABEL for r in checkpoint_ranges):
+            raise SystemExit(
+                f"--report-timing requires a checkpoint_ranges entry labeled {START_INSTANCES_LABEL!r} "
+                f"in {args.config} (see resolve_suite()'s per-instance breakdown)"
+            )
+
         # daemon=True: this thread's own loop never exits on its own, so it must not keep the
         # process alive once the main thread (the journald-tailing loop below) returns/exits.
         threading.Thread(
