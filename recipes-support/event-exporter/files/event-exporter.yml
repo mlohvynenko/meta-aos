@@ -1,76 +1,11 @@
-# Config for event_exporter.py, consumed via --config. Two sections, both describing the same
-# underlying thing - which of a service's log checkpoints matter, and how - for two different
-# purposes: "patterns" for forwarding matching journald lines live as checkpoint_event samples,
-# "checkpoint_ranges" for resolving elapsed time between pairs of those same samples afterward (see
-# --report-timing). Nothing here is AosCore-specific in principle - point both sections at another
-# service's own log/checkpoint conventions to reuse this same script without a code change - but
-# the defaults below are AosCore's.
-
-# Each journald log line is tried against these patterns in order; the first capture group of the
-# first pattern that matches becomes the "event" label pushed to VictoriaMetrics. A line that
-# matches no pattern is ignored.
+# Checkpoint regexes for event_exporter.py, consumed via --config. Each journald log line is
+# tried against these patterns in order; the first capture group of the first pattern that matches
+# becomes the "event" label pushed to VictoriaMetrics. A line that matches no pattern is ignored.
 #
 # The default pattern below matches AosCore's own "[profiling] <text>" checkpoint lines (e.g.
-# "[profiling] Start instance begin").
+# "[profiling] Start instance begin"), but nothing about event_exporter.py is AosCore-specific -
+# add more patterns here to also capture checkpoints from other services' own log conventions.
+
 patterns:
   - '\[profiling\]\s*(.*)'
   - '^((?:Starting|Started|Stopping|Stopped) AosCore.*)'
-
-# The checkpoint-pair table each --report-timing timing metric is resolved from - one entry per
-# elapsed-time metric published as a benchmark_result sample. Each entry needs a "label" (the
-# metric's display/publish name), "start_source"/"start_event" and "end_source"/"end_event" (the
-# checkpoint_event "source"/"event" label values that bracket it), and may set "nearest_end: true"
-# or "optional_all: true" for two specific edge cases - see event_exporter.py's RangeJob and its own
-# module docstring's checkpoint table for what these mean and why AosCore's own checkpoints need
-# them. The entry labeled "Start instances" is required if any entry is given at all: besides being
-# an ordinary metric in its own right, it also drives the per-instance "Start instances" breakdown
-# (see event_exporter.py's START_INSTANCES_LABEL).
-checkpoint_ranges:
-  - label: Download
-    start_source: aos-cm.service
-    start_event: "Download update items start"
-    end_source: aos-cm.service
-    end_event: "Download update items end"
-  - label: Install
-    start_source: aos-sm.service
-    start_event: "Install items begin"
-    end_source: aos-sm.service
-    end_event: "Install items end"
-  - label: Prepare
-    start_source: aos-sm.service
-    start_event: "Prepare instances begin"
-    end_source: aos-sm.service
-    end_event: "Prepare instances end"
-  - label: Init SM
-    start_source: init.scope
-    start_event: "Starting AosCore Service Manager..."
-    end_source: aos-sm.service
-    end_event: "Update instances begin"
-    nearest_end: true
-  - label: Start network
-    start_source: aos-sm.service
-    start_event: "Start networks begin"
-    end_source: aos-sm.service
-    end_event: "Start networks end"
-  - label: Start instances
-    start_source: aos-sm.service
-    start_event: "Start instances begin"
-    end_source: aos-sm.service
-    end_event: "Start instances end"
-  - label: Stop network
-    start_source: aos-sm.service
-    start_event: "Stop all networks begin"
-    end_source: aos-sm.service
-    end_event: "Stop all networks end"
-    optional_all: true
-  - label: Stop instances
-    start_source: aos-sm.service
-    start_event: "Stop all instances begin"
-    end_source: aos-sm.service
-    end_event: "Stop all instances end"
-    optional_all: true
-  - label: Release SM
-    start_source: aos-sm.service
-    start_event: "Stop all networks end"
-    end_source: init.scope
-    end_event: "Stopped AosCore Service Manager."
